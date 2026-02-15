@@ -255,3 +255,124 @@ Deliverable: `tests/oracle_*` and “compare mode” runner.
   - optional “strict mode” that aborts on any unhandled path syscall
 
 Deliverable: `DOCS.md`, `SYSCALLS.md`, debug flags.
+
+---
+
+## 13. Multi-thread / clone / fork correctness (ptrace completeness)
+Real workloads are multi-threaded; “100% chroot compatible” is meaningless if only the initial thread is traced correctly.
+
+Tasks:
+- Enable and handle:
+  - `PTRACE_O_TRACECLONE`
+  - `PTRACE_O_TRACEFORK`
+  - `PTRACE_O_TRACEVFORK`
+  - `PTRACE_O_TRACEEXEC`
+  - `PTRACE_O_EXITKILL` (so tracees die if tracer dies)
+- Maintain a per-TID state map:
+  - entry/exit detection must be per-thread (do not use a single global toggle)
+  - per-thread cwd/dirfd table (or shared with proper locking semantics)
+- Attach to new threads promptly and resume them in a consistent way:
+  - handle `waitpid(-1, __WALL)` patterns
+  - ensure syscall-stop semantics for all threads
+
+Deliverable: a test that starts threads (`pthread_create`) and performs path syscalls from non-main threads, matching the oracle.
+
+---
+
+## 14. Two-path syscalls: make both sides chroot-correct
+String rewriting that touches only one argument is not chroot-compatible.
+
+Tasks:
+- Implement full two-path translation for:
+  - `renameat`, `renameat2`
+  - `linkat`
+  - `symlinkat` (translate link location only; preserve link contents as guest-space)
+  - `mount`-like path pairs (if ever supported) must match chroot expectations/errno
+- Implement correct flags semantics:
+  - `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT`
+  - `AT_SYMLINK_FOLLOW` for `linkat`
+- Add oracle tests for each syscall with:
+  - absolute + relative combinations
+  - cwd changes and dirfds
+  - symlink interactions on both paths
+
+Deliverable: full two-path parity for these syscalls (return values + filesystem effects).
+
+---
+
+## 15. `/proc/self/fd` escape prevention and fd-path semantics
+Even under a real `chroot`, file descriptors can reference host paths; however path-based access through `/proc/self/fd/*` must not let you break the guest view.
+
+Tasks:
+- Intercept:
+  - `open/openat/openat2` of `/proc/self/fd/<n>` and equivalents (`/proc/<pid>/fd/<n>`)
+  - `readlink*` of `/proc/self/fd/<n>` and `/proc/self/{cwd,root,exe}`
+- Ensure results are guest-path-correct:
+  - hide host rootfs prefix in link targets
+  - preserve “(deleted)” semantics where applicable
+- Decide and document the “fd escape” policy:
+  - strict mode: deny opening `/proc/self/fd/*` by path if it would escape guest root
+  - default mode: match a real chroot with mounted /proc as closely as possible
+
+Deliverable: proc-fd tests that attempt common escape patterns and compare against oracle behavior.
+
+---
+
+## 16. `getcwd` and cwd tracking (including `fchdir`)
+Chroot semantics depend on correct cwd behavior.
+
+Tasks:
+- Track `chdir` and `fchdir`.
+- Track `*at(dirfd=...)` base resolution using fd-table (not `/proc/self/fd` readlink hacks).
+- Make `getcwd` return guest paths without host prefix leakage.
+
+Deliverable: oracle tests covering cwd changes, nested symlinks, and relative syscalls after `fchdir`.
+
+---
+
+## 17. Strictness modes and “unknown syscall” policy
+To reach “100%”, you must stop silently doing the wrong thing.
+
+Tasks:
+- Add a `strict` mode:
+  - if an unhandled path-related syscall occurs, abort the tracee with a clear error
+  - optionally dump the syscall number + args + PC mapping (guest vs host)
+- Add an “audit” mode:
+  - log every unique syscall that passes through untranslated while in guest code
+  - output a frequency summary to drive the syscall inventory
+
+Deliverable: a reproducible workflow to close the syscall coverage gap until oracle parity is reached.
+
+---
+
+## 18. Performance / scalability (so it is usable)
+Ptrace is expensive; correctness work should not regress performance unnecessarily.
+
+Tasks:
+- Minimize stop/resume overhead:
+  - prefer `PTRACE_SYSCALL` over `SINGLESTEP` except in explicit debug mode
+  - avoid `/proc/<pid>/maps` polling in the hot path
+- Optimize string reads/writes:
+  - bounded reads, cache rewritten strings per TID when possible
+  - avoid reallocations, reuse buffers
+- Add a micro-benchmark harness:
+  - “stat storm” and “open storm” inside guest
+
+Deliverable: perf regression test or benchmark numbers for key workloads (pacman, shell startup).
+
+---
+
+## 19. Android integration hardening (packaging/runtime)
+This repo runs under Termux, but the eventual goal is embedding this into an Android app.
+
+Tasks:
+- Loader-shim packaging strategy (stable toolchain):
+  - ship as separate executable asset, extract at runtime, `chmod +x`
+  - or embed prebuilt shim bytes per-ABI and materialize on demand
+- Ensure SELinux/exec policies are compatible with the target deployment:
+  - document where executables can live (`app_data_dir`, `tmp`, etc.)
+- Add “self-check” diagnostics:
+  - detect kernel features (`openat2`, `PTRACE_GET_SYSCALL_INFO`)
+  - detect seccomp traps that must be emulated
+
+Deliverable: an Android-app-friendly “ensure shim available” helper + documentation.
