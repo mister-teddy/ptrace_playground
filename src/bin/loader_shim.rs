@@ -2,13 +2,29 @@
 #![no_main]
 
 // Minimal aarch64 loader shim inspired by proot-rs/loader-shim.
-// This binary runs as the tracee. The tracer rewrites path syscalls so that
-// absolute guest paths are resolved inside the chosen rootfs.
+//
+// Why this exists (Android-specific):
+// - We want to start a *glibc* dynamic loader (`ld-linux-aarch64.so.1`) inside an Android process.
+// - Android's host dynamic loader (`/system/bin/linker64`) cannot "linger" in the address space,
+//   because glibc's ld.so assumes a different TLS layout (TPIDR_EL0 usage) and will crash if
+//   host runtime signal/TLS machinery runs after glibc takes over.
+// - Therefore we do a two-stage start:
+//   1) Let Android exec a normal PIE binary (this shim) so the kernel/linker64 are happy.
+//   2) In this shim, explicitly dismantle linker64 state we must not keep (munmap it), then map
+//      and jump into the guest interpreter with a Linux-like initial stack/auxv.
+//
+// This binary runs as the tracee. The tracer (our ptrace "rootless chroot") rewrites path syscalls
+// so guest absolute paths resolve inside the chosen rootfs.
 
 use core::arch::{asm, global_asm};
 
 // We need the initial kernel-provided stack pointer before any Rust prologue runs.
 // Define a tiny assembly `_start` that forwards `sp` into `rust_start(sp)`.
+//
+// Why custom `_start`:
+// - It keeps the very first instructions under our control (no libc crt, no TLS, no stack probes).
+// - That matters because we will later replace TPIDR_EL0 and unmap linker64; any early runtime
+//   code that assumes Android TLS or signal trampolines would become a time bomb.
 global_asm!(
     r#"
     .global _start
@@ -20,6 +36,11 @@ _start:
     .global shim_rt_sigreturn
     .type shim_rt_sigreturn,%function
 shim_rt_sigreturn:
+    // Why we need a private sigreturn trampoline:
+    // - After we `munmap()` linker64, any signal handler/restorer pointer that used to point into
+    //   linker64 becomes invalid.
+    // - The kernel uses the `sa_restorer` pointer (SA_RESTORER) to return from a signal handler.
+    // - So we provide a tiny "restorer" that just performs the `rt_sigreturn` syscall.
     mov x8, #139         // __NR_rt_sigreturn on aarch64
     svc #0
 "#
@@ -287,6 +308,11 @@ unsafe extern "C" fn shim_segv_handler(sig: i32, _info: *mut u8, uctx: *mut UCon
 unsafe fn sys_disable_sigaltstack_and_handlers() {
     // Disable altstack so ptrace sees SIGSEGV at the actual faulting PC, not inside
     // the Android linker/bionic signal handler running on an alternate stack.
+    //
+    // Why we do this:
+    // - Android's linker uses a sigchain mechanism and may handle faults first.
+    // - Once we switch to guest TLS (TPIDR_EL0), host sigchain code can crash or obscure the real
+    //   guest faulting PC (it runs with assumptions about bionic TLS).
     let ss = KernelStackT {
         ss_sp: 0,
         ss_flags: SS_DISABLE,
@@ -299,6 +325,10 @@ unsafe fn sys_disable_sigaltstack_and_handlers() {
 
     // Force SIGSEGV handling back to the kernel default. This prevents Android's linker64
     // sigchain handler from running after we switch TPIDR_EL0 for the guest glibc loader.
+    //
+    // Why "default", not our own handler:
+    // - We want crashes to be "plain" process crashes rather than bouncing through host sigchain.
+    // - The ptrace tracer can still observe SIGSEGV and dump the *guest* registers/stack.
     let mut old = KernelSigAction {
         sa_handler: 0,
         sa_flags: 0,
@@ -368,24 +398,33 @@ struct SigInfoHeader {
 unsafe fn install_sigsys_emulation_handler() {
     // Install a SIGSYS handler with our own restorer so we can survive SECCOMP_RET_TRAP after
     // unmapping Android's linker64.
+    //
+    // Why this is needed:
+    // - Some Android environments deliver seccomp "trap" events as SIGSYS.
+    // - Normally bionic/linker64 provides the signal return machinery.
+    // - After we unmap linker64, SIGSYS must still be handled because glibc ld.so may probe
+    //   syscalls (e.g. set_robust_list, rseq). We emulate the minimum needed for bring-up.
     unsafe extern "C" fn sigsys_handler(_sig: i32, info: *mut u8, uctx: *mut UContext) {
         if uctx.is_null() {
             return;
         }
         let uc = &mut *uctx;
-        // Decode siginfo for SIGSYS: call_addr (u64) at +16, syscall (i32) at +24, arch (u32) at +28.
-        let mut sysno: i32 = -1;
-        if !info.is_null() {
-            let base = info as *const u8;
-            // best-effort: trust header exists
-            let _hdr = &*(base as *const SigInfoHeader);
-            sysno = core::ptr::read_unaligned(base.add(24) as *const i32);
-        }
+        // Prefer the syscall number from the trapped register state (x8) rather than relying on
+        // `siginfo_t` layout details (which are easy to get subtly wrong across ABIs).
+        let sysno: i32 = uc.uc_mcontext.regs[8] as i32;
 
         // Emulate (skip) selected syscalls.
         // On aarch64, return value is in x0.
         if sysno == 99 {
             // set_robust_list: pretend success.
+            uc.uc_mcontext.regs[0] = 0;
+            return;
+        }
+        if sysno == 439 {
+            // faccessat2: Android seccomp commonly traps this. Many userspace libraries use it
+            // as a best-effort capability/permission probe. For our rootless environment, treat
+            // it as success rather than aborting on ENOSYS.
+            write_str("loader_shim: emu faccessat2\n");
             uc.uc_mcontext.regs[0] = 0;
             return;
         }
@@ -421,6 +460,11 @@ unsafe fn install_sigsys_emulation_handler() {
 unsafe fn reset_all_signal_handlers_to_default() {
     // If we unmap linker64, we must not leave any handlers pointing into it.
     // Reset almost all signals to SIG_DFL (ignore SIGKILL/SIGSTOP).
+    //
+    // Why "reset everything" instead of trying to be surgical:
+    // - On Android, a surprising number of handlers are installed early (debuggerd, sigchain).
+    // - Any stale handler pointer into unmapped linker64 is instant UB the next time that signal
+    //   fires. Default actions are boring but safe for our "handoff to glibc" phase.
     let act = KernelSigAction {
         sa_handler: 0, // SIG_DFL
         sa_flags: 0,
@@ -481,6 +525,13 @@ fn parse_hex_u64(mut p: *const u8, end: *const u8) -> Option<(u64, *const u8)> {
 
 unsafe fn unmap_android_linker64() {
     // Best-effort: read /proc/self/maps and munmap every range whose pathname contains "linker64".
+    //
+    // Why `munmap()` at all:
+    // - Keeping linker64 mapped means keeping Android TLS + sigchain assumptions alive.
+    // - glibc ld.so will re-purpose TPIDR_EL0 and expects its own TLS layout; host code running
+    //   after that can crash (and has, in practice) in signal paths.
+    // - We cannot `dlclose()` here (no libc), so `/proc/self/maps` + `munmap()` is the pragmatic
+    //   low-level approach.
     let path = b"/proc/self/maps\0";
     let fd = sys_open(path.as_ptr());
     if fd < 0 {
@@ -997,6 +1048,10 @@ pub unsafe extern "C" fn rust_start(sp: *mut Word) -> ! {
         sys_exit(127);
     };
 
+    // Why we open/parse/map both target and interpreter ourselves:
+    // - If we `execve()` the guest binary normally, the host loader (linker64) remains in charge.
+    // - We want a clean handoff into the guest interpreter without another round of host dynamic
+    //   linking, so we map ET_DYN images ourselves and jump directly to ld.so entry.
     let Some((tbias, tstart, tentry)) = map_image(tfd, &tinfo) else {
         write_str("loader_shim: map target failed\n");
         sys_exit(127);
@@ -1020,10 +1075,11 @@ pub unsafe extern "C" fn rust_start(sp: *mut Word) -> ! {
         write_str("loader_shim: [TP] skipped (low)\n");
     }
 
-    // NOTE: we intentionally do NOT modify TPIDR_EL0 here.
-    // Android's runtime (linker64, debuggerd, etc.) assumes TPIDR_EL0 points to bionic TLS.
-    // If the guest glibc loader needs a different TLS layout, we must emulate it without
-    // breaking the host runtime (e.g. by patching guest instructions).
+    // We delay changing TPIDR_EL0 until the last moment:
+    // - While linker64 is still mapped and signal handlers are still pointing into it, switching
+    //   TPIDR_EL0 to a glibc layout can crash host code (especially on signals).
+    // - So we first install our own signal return plumbing and unmap linker64, then set TPIDR_EL0
+    //   to a guest-compatible region right before entering glibc ld.so.
 
     // Build a new stack that looks like a normal execve() of the target.
     // This avoids subtle loader expectations around AT_RANDOM/AT_PLATFORM being located on the stack.
@@ -1202,6 +1258,11 @@ pub unsafe extern "C" fn rust_start(sp: *mut Word) -> ! {
     push(new_argc as Word);
 
     write_str("loader_shim: jumping\n");
+    // Ordering here is deliberate:
+    // 1) Neutralize Android's signal stack/handlers (avoid sigchain surprises).
+    // 2) Reset signal handlers so nothing points into linker64.
+    // 3) Install SIGSYS emulation with our own restorer (seccomp traps must still return safely).
+    // 4) Unmap linker64 so host runtime can't accidentally run after we switch to guest TLS.
     sys_disable_sigaltstack_and_handlers();
     reset_all_signal_handlers_to_default();
     install_sigsys_emulation_handler();
@@ -1211,8 +1272,9 @@ pub unsafe extern "C" fn rust_start(sp: *mut Word) -> ! {
     // glibc ld-linux writes at negative offsets from TPIDR_EL0 very early (e.g. TP-0x660),
     // which will SEGV if TPIDR_EL0 still points into bionic/linker64 TLS.
     //
-    // This is inherently risky on Android (host code expects bionic TLS), but we disable the
-    // host's SIGSEGV altstack/handlers above to reduce interference during guest bring-up.
+    // This is inherently risky on Android (host code expects bionic TLS), which is why we
+    // aggressively remove host loader influence above. At this point we want "as little Android
+    // runtime as possible" and "as much Linux/glibc illusion as needed" to let ld.so initialize.
     let fake_tls_len = 0x20000usize;
     let fake_tls = sys_mmap(0, fake_tls_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if fake_tls >= 0 {
