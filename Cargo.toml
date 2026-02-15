@@ -5,3 +5,15 @@ edition = "2024"
 
 [dependencies]
 nix = { version = "0.31.1", features = ["ptrace", "fs"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "loader_shim"
+path = "src/bin/loader_shim.rs"
+test = false
+bench = false
