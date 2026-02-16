@@ -5,6 +5,20 @@
 - [x] Loader-shim startup model: custom `_start`, unmap Android `linker64`, reset signal handlers, install private `rt_sigreturn` restorer, set guest TLS before jumping into glibc `ld-linux`. (commit `553479b`)
 - [x] End-to-end tests: `pacman -V` and a network test (`pacman -Syy` + `pacman -Ss '^bash$'`) in the Arch aarch64 rootfs. (commit `0e128ba`)
 
+## Progress update (2026-02-16)
+- [x] Enabled ptrace multi-thread/process event handling in tracer loop:
+  - `PTRACE_O_TRACECLONE`, `PTRACE_O_TRACEFORK`, `PTRACE_O_TRACEVFORK`, `PTRACE_O_TRACEEXEC`, `PTRACE_O_EXITKILL`
+  - `waitpid(-1, __WALL)` event loop + `PTRACE_GETEVENTMSG` handling
+  - per-TID syscall entry/exit fallback tracking
+- [x] Implemented two-path syscall translation parity improvements:
+  - `linkat`: translate both old/new paths
+  - `renameat`/`renameat2`: translate both old/new paths
+  - `symlinkat`: translate link location only; preserve target contents unchanged
+- [x] Added syscall coverage docs and audit hooks:
+  - `SYSCALLS.md` with handled/pass-through inventory
+  - `DOCS.md` with guarantees/gaps and PRoot comparison
+  - `PTRACE_PLAYGROUND_AUDIT=1` for unhandled path-related syscall logging
+
 Target: indistinguishable from `chroot(rootfs)` for all observable filesystem path behavior from inside the guest process tree, to the extent the kernel would behave under a real chroot by the same uid/gid and mount namespace.
 
 This implies:
@@ -376,3 +390,11 @@ Tasks:
   - detect seccomp traps that must be emulated
 
 Deliverable: an Android-app-friendly “ensure shim available” helper + documentation.
+
+---
+
+## 20. Arch pacman network search sanity
+- Change the `pacman -Ss` test to search for `code` instead of `^bash$` so the test exercises a broader query.
+- Print the search output during the test to make failures easier to debug in CI.
+- Assert on a predictable match (`extra/codeblocks`) so the test still verifies that real data is coming back.
+Deliverable: `tests/rootless.rs` log/assert adjustments and successful `cargo test can_pacman_sync_search_over_network`.

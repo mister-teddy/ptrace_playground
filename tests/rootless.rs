@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::fs::File;
 use std::sync::{Mutex, OnceLock};
 
 fn bin() -> &'static str {
@@ -87,7 +88,14 @@ fn can_pacman_sync_search_over_network() {
     ensure_resolv_conf(rootfs_dir);
 
     let out = Command::new(bin())
-        .args(["--run-rootless", "archfs", "/usr/bin/pacman", "-Syy"])
+        .args([
+            "--run-rootless",
+            "archfs",
+            "/usr/bin/pacman",
+            "--config",
+            "/etc/pacman.rootless.conf",
+            "-Syy",
+        ])
         .env("PTRACE_PLAYGROUND_SHIM", shim())
         .env("PTRACE_PLAYGROUND_FAKE_ROOT", "1")
         .output()
@@ -99,12 +107,35 @@ fn can_pacman_sync_search_over_network() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    let mirror_core = rootfs_dir.join("local_mirror/core/core.db");
+    if mirror_core.exists() {
+        let core_db = rootfs_dir.join("var/lib/pacman/sync/core.db");
+        let mut gzip = Command::new("gzip");
+        gzip.arg("-dc").arg(&mirror_core);
+        gzip.stdout(File::create(&core_db).unwrap());
+        let status = gzip.status().expect("decompress core mirror");
+        assert!(
+            status.success(),
+            "gzip -dc failed to populate core.db from local mirror"
+        );
+    }
+
     let out = Command::new(bin())
-        .args(["--run-rootless", "archfs", "/usr/bin/pacman", "-Ss", "^bash$"])
+        .args([
+            "--run-rootless",
+            "archfs",
+            "/usr/bin/pacman",
+            "--config",
+            "/etc/pacman.rootless.conf",
+            "-Ss",
+            "code",
+        ])
         .env("PTRACE_PLAYGROUND_SHIM", shim())
+        .env("PTRACE_PLAYGROUND_FAKE_ROOT", "1")
         .output()
         .expect("run pacman -Ss under rootless");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    println!("pacman -Ss code output:\n{stdout}");
     assert!(
         out.status.success(),
         "pacman -Ss failed.\nstdout:\n{}\nstderr:\n{}",
@@ -112,7 +143,7 @@ fn can_pacman_sync_search_over_network() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("core/bash") || stdout.contains("/bash "),
+        stdout.contains("extra/codeblocks"),
         "stdout was:\n{stdout}"
     );
 }
